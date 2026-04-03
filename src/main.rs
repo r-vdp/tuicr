@@ -266,6 +266,9 @@ fn main() -> anyhow::Result<()> {
     let mut pending_semicolon = false;
     // Track pending Ctrl+C for "press twice to exit" (with timestamp for 2s timeout)
     let mut pending_ctrl_c: Option<Instant> = None;
+    // Only re-render when state actually changed; the diff renderer rebuilds
+    // every line on each draw, so idle redraws are expensive on large diffs.
+    let mut needs_redraw = true;
 
     // Main loop
     loop {
@@ -277,6 +280,7 @@ fn main() -> anyhow::Result<()> {
             ) = rx.try_recv()
         {
             app.update_info = Some(info);
+            needs_redraw = true;
         }
 
         // Auto-clear expired pending Ctrl+C state and message
@@ -285,14 +289,21 @@ fn main() -> anyhow::Result<()> {
         {
             pending_ctrl_c = None;
             app.message = None;
+            needs_redraw = true;
         }
 
-        app.clear_expired_message();
+        if app.message.is_some() {
+            app.clear_expired_message();
+            needs_redraw |= app.message.is_none();
+        }
 
         // Render
-        terminal.draw(|frame| {
-            ui::render(frame, &mut app);
-        })?;
+        if needs_redraw {
+            terminal.draw(|frame| {
+                ui::render(frame, &mut app);
+            })?;
+            needs_redraw = false;
+        }
 
         // Handle events.
         // Drain all pending events before the next render so that bursts of
@@ -505,6 +516,11 @@ fn main() -> anyhow::Result<()> {
             if app.should_quit {
                 break;
             }
+        }
+
+        // Any event (key, resize, mouse, ...) may have changed visible state.
+        if drained > 0 {
+            needs_redraw = true;
         }
 
         if app.should_quit {
