@@ -297,6 +297,12 @@ fn main() -> anyhow::Result<()> {
             needs_redraw |= app.message.is_none();
         }
 
+        // Apply any background syntax-highlight results that arrived since the
+        // last frame so colours fill in without blocking startup.
+        if app.drain_highlight_results() {
+            needs_redraw = true;
+        }
+
         // Render
         if needs_redraw {
             // Bracket the frame in a synchronized-output pair (CSI ?2026h/l) so
