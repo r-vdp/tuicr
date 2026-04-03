@@ -1,0 +1,79 @@
+diff --git a/src/terminal/terminal.rs b/src/terminal/terminal.rs
+index f17d96d..cbbe21a 100644
+--- a/src/terminal/terminal.rs
++++ b/src/terminal/terminal.rs
+@@ -564,6 +564,74 @@ where
+         self.current = 1 - self.current;
+     }
+ 
++    /// Scroll a horizontal band of rows on the physical terminal and mirror the
++    /// same shift in the previous (on-screen) buffer so the next [`draw`] only
++    /// emits the rows that scrolled into view.
++    ///
++    /// This must be called between two [`draw`] calls. `region` is a half-open
++    /// range of absolute screen rows. A positive `delta` scrolls content up
++    /// (new rows appear at the bottom), negative scrolls down.
++    ///
++    /// Note: terminal scroll regions span the full terminal width, so any
++    /// columns outside the caller's intended panel are shifted too; the next
++    /// [`draw`] will repaint those as part of its diff.
++    ///
++    /// [`draw`]: Self::draw
++    #[cfg(feature = "scrolling-regions")]
++    pub fn scroll_region(
++        &mut self,
++        region: core::ops::Range<u16>,
++        delta: i32,
++    ) -> Result<(), B::Error> {
++        if delta == 0 || region.is_empty() {
++            return Ok(());
++        }
++        let area = self.buffers[1 - self.current].area;
++        let top = region.start.max(area.top());
++        let bottom = region.end.min(area.bottom());
++        if top >= bottom {
++            return Ok(());
++        }
++        let amount = delta.unsigned_abs().min(u32::from(bottom - top)) as u16;
++        if delta > 0 {
++            self.backend.scroll_region_up(top..bottom, amount)?;
++        } else {
++            self.backend.scroll_region_down(top..bottom, amount)?;
++        }
++
++        let width = area.width as usize;
++        let row_start = |y: u16| (y - area.top()) as usize * width;
++        let buf = &mut self.buffers[1 - self.current].content;
++        if delta > 0 {
++            for y in top..bottom.saturating_sub(amount) {
++                let (dst, src) = (row_start(y), row_start(y + amount));
++                for x in 0..width {
++                    buf[dst + x] = buf[src + x].clone();
++                }
++            }
++            for y in bottom.saturating_sub(amount)..bottom {
++                let dst = row_start(y);
++                for x in 0..width {
++                    buf[dst + x] = Cell::EMPTY;
++                }
++            }
++        } else {
++            for y in (top + amount..bottom).rev() {
++                let (dst, src) = (row_start(y), row_start(y - amount));
++                for x in 0..width {
++                    buf[dst + x] = buf[src + x].clone();
++                }
++            }
++            for y in top..top + amount {
++                let dst = row_start(y);
++                for x in 0..width {
++                    buf[dst + x] = Cell::EMPTY;
++                }
++            }
++        }
++        Ok(())
++    }
++
+     /// Queries the real size of the backend.
+     pub fn size(&self) -> Result<Size, B::Error> {
+         self.backend.size()
