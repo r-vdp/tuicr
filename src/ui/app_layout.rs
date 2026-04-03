@@ -11,10 +11,18 @@ use crate::app::{
     AnnotatedLine, App, DiffViewMode, ExpandDirection, FileTreeItem, FocusedPanel,
     GAP_EXPAND_BATCH, GapId, InputMode, VisualSelection,
 };
+use crate::model::Comment;
 use crate::model::{LineOrigin, LineRange, LineSide};
 use crate::theme::Theme;
 use crate::ui::{comment_panel, help_popup, status_bar, styles};
 use crate::vcs::git::calculate_gap;
+
+/// Static header rule used for file/section headers; avoids `"═".repeat(40)` per frame.
+const HEADER_RULE: &str = "════════════════════════════════════════";
+
+/// Shared empty map so we can borrow `line_comments` without cloning per file per frame.
+static EMPTY_LINE_COMMENTS: std::sync::LazyLock<std::collections::HashMap<u32, Vec<Comment>>> =
+    std::sync::LazyLock::new(std::collections::HashMap::new);
 
 pub fn render(frame: &mut Frame, app: &mut App) {
     frame.render_widget(
@@ -653,7 +661,7 @@ fn render_unified_diff(frame: &mut Frame, app: &mut App, area: Rect) {
             "═══ Review Comments ",
             styles::file_header_style(&app.theme),
         ),
-        Span::styled("═".repeat(40), styles::file_header_style(&app.theme)),
+        Span::styled(HEADER_RULE, styles::file_header_style(&app.theme)),
     ]));
     line_idx += 1;
 
@@ -752,7 +760,7 @@ fn render_unified_diff(frame: &mut Frame, app: &mut App, area: Rect) {
         lines.push(Line::from(vec![
             Span::styled(indicator, styles::current_line_indicator_style(&app.theme)),
             Span::styled(header_text, styles::file_header_style(&app.theme)),
-            Span::styled("═".repeat(40), styles::file_header_style(&app.theme)),
+            Span::styled(HEADER_RULE, styles::file_header_style(&app.theme)),
         ]));
         line_idx += 1;
 
@@ -886,8 +894,7 @@ fn render_unified_diff(frame: &mut Frame, app: &mut App, area: Rect) {
                 .files
                 .get(path)
                 .map(|r| &r.line_comments)
-                .cloned()
-                .unwrap_or_default();
+                .unwrap_or(&EMPTY_LINE_COMMENTS);
 
             for (hunk_idx, hunk) in file.hunks.iter().enumerate() {
                 // Calculate and render gap before this hunk
@@ -1399,7 +1406,21 @@ fn render_unified_diff(frame: &mut Frame, app: &mut App, area: Rect) {
     }
 
     let scroll_x = app.diff_state.scroll_x;
-    let visible_lines_unscrolled_for_bg = visible_lines_unscrolled.clone();
+    let visible_line_count = visible_lines_unscrolled.len();
+
+    // Paint per-visual-row add/del backgrounds across full row width.
+    // Do this before `apply_horizontal_scroll` consumes the unscrolled lines so
+    // we don't need to clone them just to inspect prefixes/backgrounds.
+    paint_unified_diff_rows_with(
+        frame,
+        inner,
+        visible_line_count,
+        &line_widths,
+        app.diff_state.wrap_lines,
+        inner.width as usize,
+        |idx| unified_line_bg_style(&visible_lines_unscrolled[idx], &app.theme),
+    );
+
     let visible_lines: Vec<Line> = if app.diff_state.wrap_lines {
         visible_lines_unscrolled
     } else {
@@ -1408,17 +1429,6 @@ fn render_unified_diff(frame: &mut Frame, app: &mut App, area: Rect) {
             .map(|line| apply_horizontal_scroll(line, scroll_x))
             .collect()
     };
-
-    // Paint per-visual-row add/del backgrounds across full row width.
-    paint_unified_diff_rows_with(
-        frame,
-        inner,
-        &visible_lines_unscrolled_for_bg,
-        &line_widths,
-        app.diff_state.wrap_lines,
-        inner.width as usize,
-        |_idx, line| unified_line_bg_style(line, &app.theme),
-    );
 
     // Keep paragraph bg unset so pre-painted per-row diff backgrounds remain visible.
     let mut diff = Paragraph::new(visible_lines).style(Style::default().fg(app.theme.fg_primary));
@@ -1433,11 +1443,11 @@ fn render_unified_diff(frame: &mut Frame, app: &mut App, area: Rect) {
         paint_unified_diff_rows_with(
             frame,
             inner,
-            &visible_lines_unscrolled_for_bg,
+            visible_line_count,
             &line_widths,
             app.diff_state.wrap_lines,
             inner.width as usize,
-            |idx, _line| {
+            |idx| {
                 is_line_highlighted(app, idx).then(|| Style::default().bg(app.theme.cursor_line_bg))
             },
         );
@@ -1933,7 +1943,7 @@ fn render_side_by_side_diff(frame: &mut Frame, app: &mut App, area: Rect) {
             "═══ Review Comments ",
             styles::file_header_style(&app.theme),
         ),
-        Span::styled("═".repeat(40), styles::file_header_style(&app.theme)),
+        Span::styled(HEADER_RULE, styles::file_header_style(&app.theme)),
     ]));
     line_idx += 1;
 
@@ -2030,7 +2040,7 @@ fn render_side_by_side_diff(frame: &mut Frame, app: &mut App, area: Rect) {
         lines.push(Line::from(vec![
             Span::styled(indicator, styles::current_line_indicator_style(&app.theme)),
             Span::styled(header_text, styles::file_header_style(&app.theme)),
-            Span::styled("═".repeat(40), styles::file_header_style(&app.theme)),
+            Span::styled(HEADER_RULE, styles::file_header_style(&app.theme)),
         ]));
         line_idx += 1;
 
@@ -2159,8 +2169,7 @@ fn render_side_by_side_diff(frame: &mut Frame, app: &mut App, area: Rect) {
                 .files
                 .get(path)
                 .map(|r| &r.line_comments)
-                .cloned()
-                .unwrap_or_default();
+                .unwrap_or(&EMPTY_LINE_COMMENTS);
 
             for (hunk_idx, hunk) in file.hunks.iter().enumerate() {
                 // Calculate and render gap before this hunk
@@ -2283,7 +2292,7 @@ fn render_side_by_side_diff(frame: &mut Frame, app: &mut App, area: Rect) {
                 // Process diff lines in side-by-side format
                 let (new_line_idx, cursor_info) = render_hunk_lines_side_by_side(
                     &hunk.lines,
-                    &line_comments,
+                    line_comments,
                     &ctx,
                     file_idx,
                     line_idx,
@@ -3101,17 +3110,17 @@ fn unified_line_bg_style(line: &Line, theme: &Theme) -> Option<Style> {
 fn paint_unified_diff_rows_with<F>(
     frame: &mut Frame,
     inner: Rect,
-    visible_lines_unscrolled: &[Line],
+    visible_line_count: usize,
     line_widths: &[usize],
     wrap_lines: bool,
     viewport_width: usize,
     style_for: F,
 ) where
-    F: Fn(usize, &Line) -> Option<Style>,
+    F: Fn(usize) -> Option<Style>,
 {
     let mut visual_row: usize = 0;
 
-    for (idx, line) in visible_lines_unscrolled.iter().enumerate() {
+    for idx in 0..visible_line_count {
         if visual_row >= inner.height as usize {
             break;
         }
@@ -3127,7 +3136,7 @@ fn paint_unified_diff_rows_with<F>(
             1
         };
 
-        if let Some(row_style) = style_for(idx, line) {
+        if let Some(row_style) = style_for(idx) {
             for _ in 0..rows_for_line {
                 if visual_row >= inner.height as usize {
                     break;
