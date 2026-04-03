@@ -14,6 +14,9 @@
       in
       {
         defaultPackage = naersk-lib.buildPackage ./.;
+        # Instrumented build that logs per-frame byte counts to
+        # ~/.cache/tuicr/frame.log; needs the vendored ratatui patch.
+        packages.debug = pkgs.callPackage ./debug.nix { };
         devShell = with pkgs; mkShell {
           buildInputs = [ cargo rustc rustfmt rustPackages.clippy jj git ];
           RUST_SRC_PATH = rustPlatform.rustLibSrc;
