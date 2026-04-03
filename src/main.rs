@@ -43,6 +43,9 @@ use theme::{parse_cli_args, resolve_theme_with_config};
 
 /// Timeout for the "press Ctrl+C again to exit" feature
 const CTRL_C_EXIT_TIMEOUT: Duration = Duration::from_secs(2);
+/// Upper bound on events drained between two renders so a flood of input
+/// (e.g. key repeat over a slow link) cannot starve the UI indefinitely.
+const MAX_EVENTS_PER_FRAME: usize = 32;
 /// Hide the file list by default on narrow terminals.
 const MIN_WIDTH_FOR_FILE_LIST: u16 = 100;
 
@@ -240,8 +243,16 @@ fn main() -> anyhow::Result<()> {
             app.message = None;
         }
 
-        // Handle events
-        if event::poll(Duration::from_millis(100))? {
+        // Handle events.
+        // Drain all pending events before the next render so that bursts of
+        // input (key repeat, paste, slow links) result in a single repaint
+        // instead of one repaint per event.
+        let mut timeout = Duration::from_millis(100);
+        let mut drained = 0usize;
+        while drained < MAX_EVENTS_PER_FRAME && event::poll(timeout)? {
+            // After the first event, only check for already-queued events.
+            timeout = Duration::ZERO;
+            drained += 1;
             let event = event::read()?;
             match event {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
@@ -427,6 +438,10 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
                 _ => {}
+            }
+
+            if app.should_quit {
+                break;
             }
         }
 
