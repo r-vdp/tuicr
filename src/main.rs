@@ -238,6 +238,12 @@ fn main() -> anyhow::Result<()> {
             needs_redraw = false;
         }
 
+        // Apply any background syntax-highlight results that arrived since the
+        // last frame so colours fill in without blocking startup.
+        if app.drain_highlight_results() {
+            needs_redraw = true;
+        }
+
         // Check for update result (non-blocking)
         if let Some(ref rx) = update_rx
             && let Ok(

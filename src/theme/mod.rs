@@ -1387,11 +1387,13 @@ pub fn resolve_theme_with_config(
 }
 
 impl Theme {
-    /// Get the syntax highlighter for this theme (lazily initialized, cached)
+    /// Get the syntax highlighter passed to diff loading.
+    ///
+    /// This is now a cheap stub with an empty syntax set so diff parsing never
+    /// blocks on syntect. Real highlighting is computed on a worker thread via
+    /// [`Self::build_full_syntax_highlighter`] and merged in once ready.
     pub fn syntax_highlighter(&self) -> &SyntaxHighlighter {
-        self.highlighter.get_or_init(|| {
-            SyntaxHighlighter::new(self.syntect_theme, self.syntax_add_bg, self.syntax_del_bg)
-        })
+        self.highlighter.get_or_init(SyntaxHighlighter::disabled)
     }
 }
 

@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 
 use chrono::Utc;
 use ratatui::style::Color;
@@ -11,7 +12,7 @@ use crate::model::{
     LineSide, ReviewSession, SessionDiffSource,
 };
 use crate::persistence::load_latest_session_for_context;
-use crate::syntax::SyntaxHighlighter;
+use crate::syntax::{HighlightedSpans, SyntaxHighlighter};
 use crate::theme::Theme;
 use crate::update::UpdateInfo;
 use crate::vcs::git::calculate_gap;
@@ -283,7 +284,20 @@ pub struct App {
     pub saved_inline_selection: Option<(usize, usize)>,
     /// Path filter for scoping diff to a specific file or directory
     pub path_filter: Option<String>,
+
+    /// Monotonically increasing token so stale background-highlight results
+    /// (from a previous diff load) can be discarded.
+    highlight_generation: u64,
+    /// Receiving end for per-file highlight results from the worker thread.
+    highlight_rx: Option<mpsc::Receiver<HighlightResult>>,
 }
+
+/// Per-hunk line content + origin captured for the highlight worker.
+type HighlightHunkInput = (Vec<String>, Vec<LineOrigin>);
+/// Per-file work item handed to the highlight worker.
+type HighlightFileInput = (PathBuf, Vec<HighlightHunkInput>);
+/// One file's worth of background highlight output: per hunk, per line spans.
+type HighlightResult = (u64, PathBuf, Vec<Vec<Option<HighlightedSpans>>>);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommentTypeDefinition {
@@ -761,6 +775,8 @@ impl App {
             range_diff_files: None,
             saved_inline_selection: None,
             path_filter: path_filter.map(|s| s.to_string()),
+            highlight_generation: 0,
+            highlight_rx: None,
         };
         // Auto-hide file list when path filter matches exactly one file
         if app.path_filter.is_some() && app.diff_files.len() == 1 {
@@ -770,6 +786,7 @@ impl App {
         app.sort_files_by_directory(true);
         app.expand_all_dirs();
         app.rebuild_annotations();
+        app.request_highlighting();
         Ok(app)
     }
 
@@ -1267,6 +1284,7 @@ impl App {
         self.sort_files_by_directory(true);
         self.expand_all_dirs();
         self.rebuild_annotations();
+        self.request_highlighting();
 
         Ok(())
     }
@@ -1302,6 +1320,7 @@ impl App {
         self.sort_files_by_directory(true);
         self.expand_all_dirs();
         self.rebuild_annotations();
+        self.request_highlighting();
 
         Ok(())
     }
@@ -1337,6 +1356,7 @@ impl App {
         self.sort_files_by_directory(true);
         self.expand_all_dirs();
         self.rebuild_annotations();
+        self.request_highlighting();
 
         Ok(())
     }
@@ -1450,6 +1470,7 @@ impl App {
         }
 
         self.rebuild_annotations();
+        self.request_highlighting();
         Ok(self.diff_files.len())
     }
 
@@ -2859,6 +2880,7 @@ impl App {
 
                     self.sort_files_by_directory(true);
                     self.expand_all_dirs();
+                    self.request_highlighting();
                 }
                 Err(_) => {
                     self.set_message("No staged or unstaged changes");
@@ -2867,6 +2889,105 @@ impl App {
         }
 
         Ok(())
+    }
+
+    /// Kick off background syntax highlighting for the current `diff_files`.
+    ///
+    /// Diff parsing now uses [`SyntaxHighlighter::disabled`], so the UI can
+    /// render immediately with plain diff colours; this fills in
+    /// `highlighted_spans` per file as results arrive. Call after every
+    /// `diff_files` mutation. Replacing `highlight_rx` drops the previous
+    /// channel, so a still-running old worker's `send`s fail and it exits.
+    pub fn request_highlighting(&mut self) {
+        self.highlight_generation = self.highlight_generation.wrapping_add(1);
+        let generation = self.highlight_generation;
+
+        // Snapshot just what the worker needs so the thread owns its inputs.
+        let work: Vec<HighlightFileInput> = self
+            .diff_files
+            .iter()
+            .filter(|f| !f.is_binary && !f.is_too_large && !f.is_commit_message)
+            .map(|f| {
+                let hunks = f
+                    .hunks
+                    .iter()
+                    .map(|h| {
+                        let contents = h.lines.iter().map(|l| l.content.clone()).collect();
+                        let origins = h.lines.iter().map(|l| l.origin).collect();
+                        (contents, origins)
+                    })
+                    .collect();
+                (f.display_path().clone(), hunks)
+            })
+            .collect();
+
+        if work.is_empty() {
+            self.highlight_rx = None;
+            return;
+        }
+
+        let syntect_theme = self.theme.syntect_theme;
+        let add_bg = self.theme.syntax_add_bg;
+        let del_bg = self.theme.syntax_del_bg;
+
+        let (tx, rx) = mpsc::channel::<HighlightResult>();
+        self.highlight_rx = Some(rx);
+
+        std::thread::spawn(move || {
+            let highlighter = SyntaxHighlighter::new(syntect_theme, add_bg, del_bg);
+            for (path, hunks) in work {
+                let mut per_hunk = Vec::with_capacity(hunks.len());
+                for (contents, origins) in &hunks {
+                    per_hunk.push(highlighter.highlight_hunk_lines(&path, contents, origins));
+                }
+                if tx.send((generation, path, per_hunk)).is_err() {
+                    // Receiver dropped (newer generation started); stop early.
+                    return;
+                }
+            }
+        });
+    }
+
+    /// Drain any ready background-highlight results into `diff_files`.
+    /// Returns `true` if anything was applied so the caller can schedule a
+    /// redraw.
+    pub fn drain_highlight_results(&mut self) -> bool {
+        let Some(rx) = self.highlight_rx.as_ref() else {
+            return false;
+        };
+        let mut applied = false;
+        let mut disconnected = false;
+        loop {
+            match rx.try_recv() {
+                Ok((generation, path, per_hunk)) => {
+                    if generation != self.highlight_generation {
+                        continue;
+                    }
+                    let Some(file) = self
+                        .diff_files
+                        .iter_mut()
+                        .find(|f| f.display_path() == &path)
+                    else {
+                        continue;
+                    };
+                    for (hunk, spans) in file.hunks.iter_mut().zip(per_hunk) {
+                        for (line, span) in hunk.lines.iter_mut().zip(spans) {
+                            line.highlighted_spans = span;
+                        }
+                    }
+                    applied = true;
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
+            }
+        }
+        if disconnected {
+            self.highlight_rx = None;
+        }
+        applied
     }
 
     pub fn toggle_diff_view_mode(&mut self) {
@@ -3220,6 +3341,7 @@ impl App {
         self.sort_files_by_directory(true);
         self.expand_all_dirs();
         self.rebuild_annotations();
+        self.request_highlighting();
 
         Ok(())
     }
@@ -3247,6 +3369,7 @@ impl App {
             self.sort_files_by_directory(true);
             self.expand_all_dirs();
             self.rebuild_annotations();
+            self.request_highlighting();
             return Ok(());
         }
 
@@ -3263,6 +3386,7 @@ impl App {
             self.sort_files_by_directory(true);
             self.expand_all_dirs();
             self.rebuild_annotations();
+            self.request_highlighting();
             return Ok(());
         }
 
@@ -3358,6 +3482,7 @@ impl App {
         self.sort_files_by_directory(true);
         self.expand_all_dirs();
         self.rebuild_annotations();
+        self.request_highlighting();
 
         Ok(())
     }
@@ -3418,6 +3543,7 @@ impl App {
         self.sort_files_by_directory(true);
         self.expand_all_dirs();
         self.rebuild_annotations();
+        self.request_highlighting();
         Ok(())
     }
 

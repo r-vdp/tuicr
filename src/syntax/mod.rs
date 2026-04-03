@@ -5,7 +5,7 @@ use two_face::theme::EmbeddedThemeName;
 use crate::model::diff_types::LineOrigin;
 
 /// A single line of highlighted spans (style + text pairs).
-type HighlightedSpans = Vec<(Style, String)>;
+pub type HighlightedSpans = Vec<(Style, String)>;
 
 /// Per-line highlight results for a file: `Some` if the line was highlighted, `None` on failure.
 type HighlightedLines = Vec<Option<HighlightedSpans>>;
@@ -38,6 +38,18 @@ impl Default for SyntaxHighlighter {
 }
 
 impl SyntaxHighlighter {
+    /// A highlighter with an empty syntax set: every lookup misses, so
+    /// `highlight_file_lines` returns `None` and diff parsing produces
+    /// `highlighted_spans = None` without paying for the two-face load.
+    pub fn disabled() -> Self {
+        Self {
+            syntax_set: syntect::parsing::SyntaxSet::new(),
+            theme: syntect::highlighting::Theme::default(),
+            add_bg: Color::Reset,
+            del_bg: Color::Reset,
+        }
+    }
+
     /// Create a new syntax highlighter with the given theme and diff background colors
     pub fn new(theme_name: EmbeddedThemeName, add_bg: Color, del_bg: Color) -> Self {
         let syntax_set = two_face::syntax::extra_newlines();
@@ -263,6 +275,30 @@ impl SyntaxHighlighter {
         }
 
         None
+    }
+
+    /// Highlight a single hunk's lines, mirroring what the diff parsers used
+    /// to do inline. Returns one entry per input line.
+    pub fn highlight_hunk_lines(
+        &self,
+        file_path: &Path,
+        contents: &[String],
+        origins: &[LineOrigin],
+    ) -> Vec<Option<HighlightedSpans>> {
+        let seq = Self::split_diff_lines_for_highlighting(contents, origins);
+        let old_hl = self.highlight_file_lines(file_path, &seq.old_lines);
+        let new_hl = self.highlight_file_lines(file_path, &seq.new_lines);
+        (0..contents.len())
+            .map(|i| {
+                self.highlighted_line_for_diff_with_background(
+                    old_hl.as_deref(),
+                    new_hl.as_deref(),
+                    seq.old_line_indices[i],
+                    seq.new_line_indices[i],
+                    origins[i],
+                )
+            })
+            .collect()
     }
 
     /// Apply diff background colors to highlighted spans based on line origin
