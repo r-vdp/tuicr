@@ -595,6 +595,13 @@ fn render_unified_diff(frame: &mut Frame, app: &mut App, area: Rect) {
     let mut line_idx: usize = 0;
     let current_line_idx = app.diff_state.cursor_line;
 
+    // Only build the expensive per-diff-line spans for lines that are actually
+    // visible. Everything else still pushes (cheap) so `lines.len()` keeps
+    // matching `line_idx`, but the hot inner loops push `Line::default()` for
+    // off-screen rows. In Comment mode the scroll offset may be adjusted after
+    // building, so fall back to a full build there.
+    let (visible_start, visible_end) = diff_visible_range(app, inner);
+
     // Track cursor position for IME when in Comment mode
     // Store the logical line index and column where the cursor should be
     let mut comment_cursor_logical_line: Option<usize> = None;
@@ -862,6 +869,11 @@ fn render_unified_diff(frame: &mut Frame, app: &mut App, area: Rect) {
                         // Render expanded context lines
                         if let Some(expanded_lines) = app.expanded_content.get(&gap_id) {
                             for expanded_line in expanded_lines {
+                                if line_idx < visible_start || line_idx >= visible_end {
+                                    lines.push(Line::default());
+                                    line_idx += 1;
+                                    continue;
+                                }
                                 let indicator = cursor_indicator(line_idx, current_line_idx);
                                 let line_num = expanded_line
                                     .new_lineno
@@ -917,109 +929,121 @@ fn render_unified_diff(frame: &mut Frame, app: &mut App, area: Rect) {
 
                 // Diff lines
                 for diff_line in &hunk.lines {
-                    let (prefix, base_style) = match diff_line.origin {
-                        LineOrigin::Addition => ("+", styles::diff_add_style(&app.theme)),
-                        LineOrigin::Deletion => ("-", styles::diff_del_style(&app.theme)),
-                        LineOrigin::Context => (" ", styles::diff_context_style(&app.theme)),
-                    };
-
-                    // Check if this line is in visual selection
-                    let is_in_visual_selection = {
-                        let line_num = match diff_line.origin {
-                            LineOrigin::Addition | LineOrigin::Context => diff_line.new_lineno,
-                            LineOrigin::Deletion => diff_line.old_lineno,
-                        };
-                        let side = match diff_line.origin {
-                            LineOrigin::Addition | LineOrigin::Context => LineSide::New,
-                            LineOrigin::Deletion => LineSide::Old,
-                        };
-                        line_num
-                            .map(|ln| app.is_line_in_visual_selection(ln, side))
-                            .unwrap_or(false)
-                    };
-
-                    // Apply visual selection highlighting if applicable
-                    let style = if is_in_visual_selection {
-                        base_style.patch(styles::visual_selection_style(&app.theme))
+                    // Hot path: skip span/style allocation entirely for diff
+                    // lines outside the viewport. Comment handling below still
+                    // runs so `line_idx` stays exact and any comment box that
+                    // crosses into the viewport is rendered.
+                    if line_idx < visible_start || line_idx >= visible_end {
+                        lines.push(Line::default());
+                        line_idx += 1;
                     } else {
-                        base_style
-                    };
+                        let (prefix, base_style) = match diff_line.origin {
+                            LineOrigin::Addition => ("+", styles::diff_add_style(&app.theme)),
+                            LineOrigin::Deletion => ("-", styles::diff_del_style(&app.theme)),
+                            LineOrigin::Context => (" ", styles::diff_context_style(&app.theme)),
+                        };
 
-                    let line_num_str = match diff_line.origin {
-                        LineOrigin::Addition => diff_line
-                            .new_lineno
-                            .map(|n| format!("{n:>4} "))
-                            .unwrap_or_else(|| "     ".to_string()),
-                        LineOrigin::Deletion => diff_line
-                            .old_lineno
-                            .map(|n| format!("{n:>4} "))
-                            .unwrap_or_else(|| "     ".to_string()),
-                        _ => diff_line
-                            .new_lineno
-                            .or(diff_line.old_lineno)
-                            .map(|n| format!("{n:>4} "))
-                            .unwrap_or_else(|| "     ".to_string()),
-                    };
-
-                    let indicator = cursor_indicator(line_idx, current_line_idx);
-
-                    // Build line spans - use syntax highlighting if available
-                    let line_num_style = if is_in_visual_selection {
-                        styles::dim_style(&app.theme)
-                            .patch(styles::visual_selection_style(&app.theme))
-                    } else {
-                        styles::dim_style(&app.theme)
-                    };
-
-                    let mut line_spans = vec![
-                        Span::styled(indicator, styles::current_line_indicator_style(&app.theme)),
-                        Span::styled(line_num_str, line_num_style),
-                        Span::styled(format!("{prefix} "), style),
-                    ];
-
-                    // Add content spans
-                    if let Some(ref highlighted) = diff_line.highlighted_spans {
-                        // Use syntax-highlighted spans
-                        for (span_style, span_text) in highlighted {
-                            let final_style = if is_in_visual_selection {
-                                span_style.patch(styles::visual_selection_style(&app.theme))
-                            } else {
-                                *span_style
+                        // Check if this line is in visual selection
+                        let is_in_visual_selection = {
+                            let line_num = match diff_line.origin {
+                                LineOrigin::Addition | LineOrigin::Context => diff_line.new_lineno,
+                                LineOrigin::Deletion => diff_line.old_lineno,
                             };
-                            line_spans.push(Span::styled(span_text.clone(), final_style));
-                        }
-                    } else {
-                        // Fall back to default diff styling
-                        line_spans.push(Span::styled(diff_line.content.clone(), style));
-                    }
-
-                    // Mark add/del lines with their effective EOL style so we can paint full
-                    // row backgrounds later (including wrapped visual rows).
-                    if matches!(
-                        diff_line.origin,
-                        LineOrigin::Addition | LineOrigin::Deletion
-                    ) {
-                        let eol_style = match diff_line.highlighted_spans.as_ref() {
-                            // For syntax-highlighted lines (including empty highlighted lines),
-                            // use syntax diff background so row fill matches code spans.
-                            Some(_) => {
-                                let syntax_bg = match diff_line.origin {
-                                    LineOrigin::Addition => app.theme.syntax_add_bg,
-                                    LineOrigin::Deletion => app.theme.syntax_del_bg,
-                                    LineOrigin::Context => app.theme.panel_bg,
-                                };
-                                let base = line_spans.last().map(|s| s.style).unwrap_or(style);
-                                base.bg(syntax_bg)
-                            }
-                            // Non-highlighted lines keep classic diff background.
-                            None => line_spans.last().map(|s| s.style).unwrap_or(style),
+                            let side = match diff_line.origin {
+                                LineOrigin::Addition | LineOrigin::Context => LineSide::New,
+                                LineOrigin::Deletion => LineSide::Old,
+                            };
+                            line_num
+                                .map(|ln| app.is_line_in_visual_selection(ln, side))
+                                .unwrap_or(false)
                         };
-                        // Zero-width marker span carrying the background style.
-                        line_spans.push(Span::styled(String::new(), eol_style));
-                    }
 
-                    lines.push(Line::from(line_spans));
-                    line_idx += 1;
+                        // Apply visual selection highlighting if applicable
+                        let style = if is_in_visual_selection {
+                            base_style.patch(styles::visual_selection_style(&app.theme))
+                        } else {
+                            base_style
+                        };
+
+                        let line_num_str = match diff_line.origin {
+                            LineOrigin::Addition => diff_line
+                                .new_lineno
+                                .map(|n| format!("{n:>4} "))
+                                .unwrap_or_else(|| "     ".to_string()),
+                            LineOrigin::Deletion => diff_line
+                                .old_lineno
+                                .map(|n| format!("{n:>4} "))
+                                .unwrap_or_else(|| "     ".to_string()),
+                            _ => diff_line
+                                .new_lineno
+                                .or(diff_line.old_lineno)
+                                .map(|n| format!("{n:>4} "))
+                                .unwrap_or_else(|| "     ".to_string()),
+                        };
+
+                        let indicator = cursor_indicator(line_idx, current_line_idx);
+
+                        // Build line spans - use syntax highlighting if available
+                        let line_num_style = if is_in_visual_selection {
+                            styles::dim_style(&app.theme)
+                                .patch(styles::visual_selection_style(&app.theme))
+                        } else {
+                            styles::dim_style(&app.theme)
+                        };
+
+                        let mut line_spans = vec![
+                            Span::styled(
+                                indicator,
+                                styles::current_line_indicator_style(&app.theme),
+                            ),
+                            Span::styled(line_num_str, line_num_style),
+                            Span::styled(format!("{prefix} "), style),
+                        ];
+
+                        // Add content spans
+                        if let Some(ref highlighted) = diff_line.highlighted_spans {
+                            // Use syntax-highlighted spans
+                            for (span_style, span_text) in highlighted {
+                                let final_style = if is_in_visual_selection {
+                                    span_style.patch(styles::visual_selection_style(&app.theme))
+                                } else {
+                                    *span_style
+                                };
+                                line_spans.push(Span::styled(span_text.clone(), final_style));
+                            }
+                        } else {
+                            // Fall back to default diff styling
+                            line_spans.push(Span::styled(diff_line.content.clone(), style));
+                        }
+
+                        // Mark add/del lines with their effective EOL style so we can paint full
+                        // row backgrounds later (including wrapped visual rows).
+                        if matches!(
+                            diff_line.origin,
+                            LineOrigin::Addition | LineOrigin::Deletion
+                        ) {
+                            let eol_style = match diff_line.highlighted_spans.as_ref() {
+                                // For syntax-highlighted lines (including empty highlighted lines),
+                                // use syntax diff background so row fill matches code spans.
+                                Some(_) => {
+                                    let syntax_bg = match diff_line.origin {
+                                        LineOrigin::Addition => app.theme.syntax_add_bg,
+                                        LineOrigin::Deletion => app.theme.syntax_del_bg,
+                                        LineOrigin::Context => app.theme.panel_bg,
+                                    };
+                                    let base = line_spans.last().map(|s| s.style).unwrap_or(style);
+                                    base.bg(syntax_bg)
+                                }
+                                // Non-highlighted lines keep classic diff background.
+                                None => line_spans.last().map(|s| s.style).unwrap_or(style),
+                            };
+                            // Zero-width marker span carrying the background style.
+                            line_spans.push(Span::styled(String::new(), eol_style));
+                        }
+
+                        lines.push(Line::from(line_spans));
+                        line_idx += 1;
+                    }
 
                     // Show line comments for both old side (deleted lines) and new side (added/context)
                     // Old side comments (for deleted lines)
@@ -1434,6 +1458,31 @@ struct SideBySideContext<'a> {
     comment_line_range: Option<LineRange>,
     editing_comment_id: Option<&'a str>,
     supports_keyboard_enhancement: bool,
+    // Only fully build spans for diff lines whose `line_idx` falls in this
+    // half-open range; off-screen rows push `Line::default()` placeholders.
+    visible_start: usize,
+    visible_end: usize,
+}
+
+impl SideBySideContext<'_> {
+    fn is_visible(&self, line_idx: usize) -> bool {
+        line_idx >= self.visible_start && line_idx < self.visible_end
+    }
+}
+
+/// Compute the half-open `line_idx` range whose diff-line spans must be fully
+/// built this frame. Outside this range the hot loops push `Line::default()`
+/// placeholders so the bulk of per-line allocations are skipped.
+///
+/// In Comment mode the scroll offset may still be adjusted after building (to
+/// keep the inline input box visible), so fall back to building everything.
+fn diff_visible_range(app: &App, inner: Rect) -> (usize, usize) {
+    if app.input_mode == InputMode::Comment {
+        (0, usize::MAX)
+    } else {
+        let start = app.diff_state.scroll_offset;
+        (start, start.saturating_add(inner.height as usize))
+    }
 }
 
 /// Get cursor indicator (single character for inline content)
@@ -1540,6 +1589,8 @@ fn render_side_by_side_diff(frame: &mut Frame, app: &mut App, area: Rect) {
         && !app.comment_is_file_level
         && !app.comment_is_review_level;
 
+    let (visible_start, visible_end) = diff_visible_range(app, inner);
+
     let ctx = SideBySideContext {
         app,
         theme: &app.theme,
@@ -1553,6 +1604,8 @@ fn render_side_by_side_diff(frame: &mut Frame, app: &mut App, area: Rect) {
         comment_line_range: app.comment_line_range.map(|(r, _)| r),
         editing_comment_id: app.editing_comment_id.as_deref(),
         supports_keyboard_enhancement: app.supports_keyboard_enhancement,
+        visible_start,
+        visible_end,
     };
 
     // Build all diff lines for side-by-side view
@@ -1820,6 +1873,11 @@ fn render_side_by_side_diff(frame: &mut Frame, app: &mut App, area: Rect) {
                         // Render expanded context lines
                         if let Some(expanded_lines) = app.expanded_content.get(&gap_id) {
                             for expanded_line in expanded_lines {
+                                if !ctx.is_visible(line_idx) {
+                                    lines.push(Line::default());
+                                    line_idx += 1;
+                                    continue;
+                                }
                                 let indicator = cursor_indicator(line_idx, ctx.current_line_idx);
                                 let line_num = expanded_line
                                     .new_lineno
@@ -2104,6 +2162,19 @@ fn render_context_line_side_by_side(
     mut line_idx: usize,
     lines: &mut Vec<Line>,
 ) -> (usize, Option<SideBySideCursorInfo>) {
+    if !ctx.is_visible(line_idx) {
+        lines.push(Line::default());
+        line_idx += 1;
+        let mut cursor_info_out: Option<SideBySideCursorInfo> = None;
+        if let Some(new_ln) = diff_line.new_lineno {
+            let (new_line_idx, cursor_info) =
+                add_comments_to_line(new_ln, line_comments, LineSide::New, ctx, line_idx, lines);
+            line_idx = new_line_idx;
+            cursor_info_out = cursor_info;
+        }
+        return (line_idx, cursor_info_out);
+    }
+
     let line_num = diff_line
         .old_lineno
         .or(diff_line.new_lineno)
@@ -2200,32 +2271,36 @@ fn render_deletion_addition_pair_side_by_side(
 
     // Render each pair of deletion/addition
     for offset in 0..max_lines {
-        let indicator = cursor_indicator(line_idx, ctx.current_line_idx);
+        if ctx.is_visible(line_idx) {
+            let indicator = cursor_indicator(line_idx, ctx.current_line_idx);
 
-        let mut spans = vec![Span::styled(
-            indicator,
-            styles::current_line_indicator_style(ctx.theme),
-        )];
+            let mut spans = vec![Span::styled(
+                indicator,
+                styles::current_line_indicator_style(ctx.theme),
+            )];
 
-        // Left side (deletion)
-        if offset < del_count {
-            let del_line = &hunk_lines[start_idx + offset];
-            add_deletion_spans(ctx.theme, &mut spans, del_line, ctx.content_width);
+            // Left side (deletion)
+            if offset < del_count {
+                let del_line = &hunk_lines[start_idx + offset];
+                add_deletion_spans(ctx.theme, &mut spans, del_line, ctx.content_width);
+            } else {
+                add_empty_column_spans(&mut spans, ctx.content_width);
+            }
+
+            spans.push(Span::styled(" │ ", styles::dim_style(ctx.theme)));
+
+            // Right side (addition)
+            if offset < add_count {
+                let add_line = &hunk_lines[add_start + offset];
+                add_addition_spans(ctx.theme, &mut spans, add_line, ctx.content_width);
+            } else {
+                add_empty_column_spans(&mut spans, ctx.content_width);
+            }
+
+            lines.push(Line::from(spans));
         } else {
-            add_empty_column_spans(&mut spans, ctx.content_width);
+            lines.push(Line::default());
         }
-
-        spans.push(Span::styled(" │ ", styles::dim_style(ctx.theme)));
-
-        // Right side (addition)
-        if offset < add_count {
-            let add_line = &hunk_lines[add_start + offset];
-            add_addition_spans(ctx.theme, &mut spans, add_line, ctx.content_width);
-        } else {
-            add_empty_column_spans(&mut spans, ctx.content_width);
-        }
-
-        lines.push(Line::from(spans));
         line_idx += 1;
 
         // Add comments for deletion
@@ -2279,17 +2354,21 @@ fn render_standalone_addition_side_by_side(
     mut line_idx: usize,
     lines: &mut Vec<Line>,
 ) -> (usize, Option<SideBySideCursorInfo>) {
-    let indicator = cursor_indicator(line_idx, ctx.current_line_idx);
+    if ctx.is_visible(line_idx) {
+        let indicator = cursor_indicator(line_idx, ctx.current_line_idx);
 
-    let mut spans = vec![Span::styled(
-        indicator,
-        styles::current_line_indicator_style(ctx.theme),
-    )];
-    add_empty_column_spans(&mut spans, ctx.content_width);
-    spans.push(Span::styled(" │ ", styles::dim_style(ctx.theme)));
-    add_addition_spans(ctx.theme, &mut spans, diff_line, ctx.content_width);
+        let mut spans = vec![Span::styled(
+            indicator,
+            styles::current_line_indicator_style(ctx.theme),
+        )];
+        add_empty_column_spans(&mut spans, ctx.content_width);
+        spans.push(Span::styled(" │ ", styles::dim_style(ctx.theme)));
+        add_addition_spans(ctx.theme, &mut spans, diff_line, ctx.content_width);
 
-    lines.push(Line::from(spans));
+        lines.push(Line::from(spans));
+    } else {
+        lines.push(Line::default());
+    }
     line_idx += 1;
 
     // Add comments if any
