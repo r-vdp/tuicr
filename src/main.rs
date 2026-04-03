@@ -16,6 +16,8 @@ mod vcs;
 
 use std::fs::File;
 use std::io::{self, Write};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -48,6 +50,31 @@ const CTRL_C_EXIT_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_EVENTS_PER_FRAME: usize = 32;
 /// Hide the file list by default on narrow terminals.
 const MIN_WIDTH_FOR_FILE_LIST: u16 = 100;
+
+/// Debug: counts bytes written to the terminal so we can log per-frame output.
+struct CountingWriter<W: Write> {
+    inner: W,
+    count: Arc<AtomicUsize>,
+}
+impl<W: Write> Write for CountingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.count.fetch_add(n, Ordering::Relaxed);
+        Ok(n)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+fn frame_log() -> Option<File> {
+    let dir = directories::BaseDirs::new()?.cache_dir().join("tuicr");
+    std::fs::create_dir_all(&dir).ok()?;
+    File::options()
+        .create(true)
+        .append(true)
+        .open(dir.join("frame.log"))
+        .ok()
+}
 
 fn main() -> anyhow::Result<()> {
     // Setup panic hook to restore terminal on panic
@@ -167,11 +194,16 @@ fn main() -> anyhow::Result<()> {
     // Setup terminal
     // When --stdout is used, render TUI to /dev/tty so stdout is free for export output
     enable_raw_mode()?;
-    let mut tty_output: Box<dyn Write> = if cli_args.output_to_stdout {
+    let byte_count = Arc::new(AtomicUsize::new(0));
+    let raw_tty: Box<dyn Write> = if cli_args.output_to_stdout {
         Box::new(File::options().write(true).open("/dev/tty")?)
     } else {
         Box::new(io::stdout())
     };
+    let mut tty_output: Box<dyn Write> = Box::new(CountingWriter {
+        inner: raw_tty,
+        count: byte_count.clone(),
+    });
     execute!(tty_output, EnterAlternateScreen)?;
 
     // Enable keyboard enhancement for better modifier key detection (e.g., Alt+Enter)
@@ -224,6 +256,8 @@ fn main() -> anyhow::Result<()> {
     // we can ask the terminal to scroll the region instead of repainting it.
     let mut last_scroll: Option<(DiffScrollSnapshot, usize)> = None;
     let mut saw_resize = false;
+    let mut dbg_log = frame_log();
+    let mut frame_no = 0usize;
 
     // Main loop
     loop {
@@ -236,6 +270,13 @@ fn main() -> anyhow::Result<()> {
             // not support DEC 2026 ignore it.
             queue!(terminal.backend_mut(), BeginSynchronizedUpdate)?;
 
+            let bytes_before = byte_count.load(Ordering::Relaxed);
+            let t0 = Instant::now();
+            let mut dbg_delta: i64 = 0;
+            let mut dbg_scrolled = false;
+            let dbg_snap = DiffScrollSnapshot::capture(&app).is_some();
+            let dbg_had_last = last_scroll.is_some();
+
             // If only the diff scroll offset changed since the last frame, ask
             // the terminal to shift the diff rows itself so ratatui's cell
             // diff only has to emit the rows that scrolled into view (plus the
@@ -247,9 +288,11 @@ fn main() -> anyhow::Result<()> {
             {
                 let delta = app.diff_state.scroll_offset as i64 - last_offset as i64;
                 let height = i64::from(snap.inner.height);
+                dbg_delta = delta;
                 if delta != 0 && delta.abs() < height {
                     let region = snap.inner.y..snap.inner.y + snap.inner.height;
                     let _ = terminal.scroll_region(region, delta as i32);
+                    dbg_scrolled = true;
                 }
             }
             saw_resize = false;
@@ -259,6 +302,20 @@ fn main() -> anyhow::Result<()> {
             })?;
             execute!(terminal.backend_mut(), EndSynchronizedUpdate)?;
             needs_redraw = false;
+
+            if let Some(log) = dbg_log.as_mut() {
+                frame_no += 1;
+                let bytes = byte_count.load(Ordering::Relaxed) - bytes_before;
+                let _ = writeln!(
+                    log,
+                    "frame={frame_no} bytes={bytes} ms={} delta={dbg_delta} scrolled={dbg_scrolled} snap={dbg_snap} had_last={dbg_had_last} wrap={} mode={:?} file_list={} area={:?}",
+                    t0.elapsed().as_millis(),
+                    app.diff_state.wrap_lines,
+                    app.input_mode,
+                    app.show_file_list,
+                    app.diff_area,
+                );
+            }
 
             last_scroll =
                 DiffScrollSnapshot::capture(&app).map(|snap| (snap, app.diff_state.scroll_offset));
