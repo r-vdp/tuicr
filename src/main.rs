@@ -309,6 +309,9 @@ fn main() -> anyhow::Result<()> {
     let mut pending_leader = false;
     // Track pending Ctrl+C for "press twice to exit" (with timestamp for 2s timeout)
     let mut pending_ctrl_c: Option<Instant> = None;
+    // Only re-render when state actually changed; the diff renderer rebuilds
+    // every line on each draw, so idle redraws are expensive on large diffs.
+    let mut needs_redraw = true;
 
     // Main loop
     'main: loop {
@@ -320,6 +323,7 @@ fn main() -> anyhow::Result<()> {
             ) = rx.try_recv()
         {
             app.update_info = Some(info);
+            needs_redraw = true;
         }
 
         // Auto-clear expired pending Ctrl+C state and message
@@ -328,35 +332,52 @@ fn main() -> anyhow::Result<()> {
         {
             pending_ctrl_c = None;
             app.message = None;
+            needs_redraw = true;
         }
 
-        app.clear_expired_message();
+        if app.message.is_some() {
+            app.clear_expired_message();
+            needs_redraw |= app.message.is_none();
+        }
+
+        // Snapshot before polling so the tick that drains a channel (clearing
+        // its rx) still triggers a redraw with the applied result. PR work
+        // forces a redraw each tick while pending so spinners animate;
+        // highlight streaming relies on `drain_highlight_updates()` instead.
+        let pr_pending = app.has_pending_pr_work();
         app.poll_pr_load_events();
         app.poll_pr_open_events();
         app.poll_pr_reload_events();
         app.poll_pr_range_reload_events();
         app.poll_pr_threads_events();
         app.poll_pr_submit_events();
-        app.poll_persisted_session_changes();
+        needs_redraw |= app.poll_persisted_session_changes();
+        needs_redraw |= pr_pending;
 
         // Drain any streaming highlight results before rendering so newly
         // arrived spans land on screen this frame.
-        app.drain_highlight_updates();
+        if app.drain_highlight_updates() {
+            needs_redraw = true;
+        }
 
-        // Render. Bracket the frame in a synchronized-output pair
-        // (CSI ?2026h/l) so terminals (and zellij) buffer the whole repaint
-        // and present it atomically. Without this, scrolling over a slow link
-        // visibly tears as escape sequences arrive in chunks. Terminals that
-        // do not support DEC 2026 ignore it.
-        queue!(terminal.backend_mut(), BeginSynchronizedUpdate)?;
-        terminal.draw(|frame| {
-            ui::render(frame, &mut app);
-        })?;
-        execute!(terminal.backend_mut(), EndSynchronizedUpdate)?;
+        // Render
+        if needs_redraw {
+            // Bracket the frame in a synchronized-output pair (CSI ?2026h/l)
+            // so terminals (and zellij) buffer the whole repaint and present
+            // it atomically. Without this, scrolling over a slow link visibly
+            // tears as escape sequences arrive in chunks. Terminals that do
+            // not support DEC 2026 ignore it.
+            queue!(terminal.backend_mut(), BeginSynchronizedUpdate)?;
+            terminal.draw(|frame| {
+                ui::render(frame, &mut app);
+            })?;
+            execute!(terminal.backend_mut(), EndSynchronizedUpdate)?;
+            needs_redraw = false;
+        }
 
-        // Shorter poll while highlight work is in flight keeps streaming
+        // Shorter poll while background work is in flight keeps streaming
         // latency under one frame; longer poll when idle to avoid wakeups.
-        let poll_timeout = if app.highlight_streaming() {
+        let poll_timeout = if app.highlight_streaming() || app.has_pending_pr_work() {
             STREAMING_POLL_TIMEOUT
         } else {
             IDLE_POLL_TIMEOUT
@@ -364,6 +385,11 @@ fn main() -> anyhow::Result<()> {
 
         // Drain queued events before redrawing; see MAX_EVENTS_PER_TICK.
         if event::poll(poll_timeout)? {
+            // Set before the drain loop so the many `continue 'main` paths
+            // inside (leader keys, zz/ZZ, dd, {count}G, …) still schedule a
+            // redraw on the next iteration even though they short-circuit
+            // past the for-loop's tail.
+            needs_redraw = true;
             for _ in 0..MAX_EVENTS_PER_TICK {
                 let event = event::read()?;
                 // Down/Up Release flips the `*_released_since_arm` flag so the

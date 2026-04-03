@@ -2052,24 +2052,32 @@ impl App {
         }
     }
 
-    pub fn poll_persisted_session_changes(&mut self) {
+    /// Returns true if visible state changed (external comments merged or a
+    /// warning was raised) so the main loop can schedule a redraw even
+    /// without an input event.
+    pub fn poll_persisted_session_changes(&mut self) -> bool {
         let Some(interval) = self.review_watch_interval else {
-            return;
+            return false;
         };
         let now = Instant::now();
         if now < self.next_review_watch_at {
-            return;
+            return false;
         }
         self.next_review_watch_at = now + interval;
 
         // Do not mutate the session while the user is composing or editing a
         // comment. The next poll after the editor closes will merge changes.
         if self.input_mode == InputMode::Comment {
-            return;
+            return false;
         }
 
-        if let Err(err) = self.reload_persisted_session_if_changed(false) {
-            self.set_warning(format!("Review reload failed: {err}"));
+        match self.reload_persisted_session_if_changed(false) {
+            Ok(0) => false,
+            Ok(_) => true,
+            Err(err) => {
+                self.set_warning(format!("Review reload failed: {err}"));
+                true
+            }
         }
     }
 
@@ -3540,18 +3548,24 @@ impl App {
     /// Spawns the worker lazily on first call after `install_diff`, so all
     /// synchronous `diff_files` reorderings have completed before any update
     /// is produced.
-    pub fn drain_highlight_updates(&mut self) {
+    /// Returns `true` if any update was applied so the caller can schedule a
+    /// redraw.
+    pub fn drain_highlight_updates(&mut self) -> bool {
         self.start_pending_highlight_session();
         let Some(session) = self.highlight_session.as_ref() else {
-            return;
+            return false;
         };
+        let mut applied = false;
         loop {
             match session.try_recv() {
-                Ok(update) => streaming::apply_update(
-                    &mut self.diff_files,
-                    self.theme.syntax_highlighter(),
-                    update,
-                ),
+                Ok(update) => {
+                    streaming::apply_update(
+                        &mut self.diff_files,
+                        self.theme.syntax_highlighter(),
+                        update,
+                    );
+                    applied = true;
+                }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     self.highlight_session = None;
@@ -3559,6 +3573,7 @@ impl App {
                 }
             }
         }
+        applied
     }
 
     /// True while the background highlight worker still has pending results,
@@ -3567,6 +3582,18 @@ impl App {
     /// screen with low latency.
     pub fn highlight_streaming(&self) -> bool {
         self.highlight_session.is_some() || !self.pending_highlight_jobs.is_empty()
+    }
+
+    /// True while any forge background fetch (PR list/open/reload/threads/
+    /// submit) is in flight. Used by the main loop to keep redrawing so
+    /// spinners animate and results land without waiting for input.
+    pub fn has_pending_pr_work(&self) -> bool {
+        self.pr_load_rx.is_some()
+            || self.pr_open_rx.is_some()
+            || self.pr_reload_rx.is_some()
+            || self.pr_range_reload_rx.is_some()
+            || self.pr_threads_rx.is_some()
+            || self.pr_submit_rx.is_some()
     }
 
     fn get_working_tree_diff_with_ignore(
