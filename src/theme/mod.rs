@@ -439,8 +439,9 @@ impl Theme {
             overlay0: rgb(110, 115, 141),
             surface2: rgb(91, 96, 120),
             surface1: rgb(73, 77, 100),
-            base: rgb(36, 39, 58),
-            mantle: rgb(30, 32, 48),
+            // Use darker background for more contrast
+            base: rgb(11, 14, 17),
+            mantle: rgb(11, 14, 17),
             crust: rgb(24, 25, 38),
             red: rgb(237, 135, 150),
             yellow: rgb(238, 212, 159),
