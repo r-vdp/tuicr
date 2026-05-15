@@ -15,7 +15,7 @@ categories = ["command-line-utilities", "development-tools"]
 # `unstable-rendered-line-info` exposes `Paragraph::line_count`, which we use to
 # measure each line's word-wrapped height with ratatui's own wrapping engine so
 # per-row diff backgrounds/overlays align exactly with the rendered text.
-ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
+ratatui = { version = "0.30", features = ["unstable-rendered-line-info", "scrolling-regions"] }
 crossterm = "0.29"
 
 # Git operations

@@ -8,6 +8,7 @@ use crossterm::{
     execute, queue,
     terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate, supports_keyboard_enhancement},
 };
+use ratatui::layout::Rect;
 
 use tuicr::app::{self, App, AppStartupOptions, FocusedPanel, InputMode};
 use tuicr::cli::parse_cli_args;
@@ -312,6 +313,10 @@ fn main() -> anyhow::Result<()> {
     // Only re-render when state actually changed; the diff renderer rebuilds
     // every line on each draw, so idle redraws are expensive on large diffs.
     let mut needs_redraw = true;
+    // Snapshot of the diff panel layout + scroll offset from the last frame so
+    // we can ask the terminal to scroll the region instead of repainting it.
+    let mut last_scroll: Option<(DiffScrollSnapshot, usize)> = None;
+    let mut saw_resize = false;
 
     // Main loop
     'main: loop {
@@ -368,11 +373,33 @@ fn main() -> anyhow::Result<()> {
             // tears as escape sequences arrive in chunks. Terminals that do
             // not support DEC 2026 ignore it.
             queue!(terminal.backend_mut(), BeginSynchronizedUpdate)?;
+
+            // If only the diff scroll offset changed since the last frame, ask
+            // the terminal to shift the diff rows itself so ratatui's cell
+            // diff only has to emit the rows that scrolled into view (plus the
+            // narrow file-list strip the full-width scroll dragged along).
+            if let Some(snap) = DiffScrollSnapshot::capture(&app)
+                && let Some((last_snap, last_offset)) = last_scroll
+                && !saw_resize
+                && snap == last_snap
+            {
+                let delta = app.diff_state.scroll_offset as i64 - last_offset as i64;
+                let height = i64::from(snap.inner.height);
+                if delta != 0 && delta.abs() < height {
+                    let region = snap.inner.y..snap.inner.y + snap.inner.height;
+                    let _ = terminal.scroll_region(region, delta as i32);
+                }
+            }
+            saw_resize = false;
+
             terminal.draw(|frame| {
                 ui::render(frame, &mut app);
             })?;
             execute!(terminal.backend_mut(), EndSynchronizedUpdate)?;
             needs_redraw = false;
+
+            last_scroll =
+                DiffScrollSnapshot::capture(&app).map(|snap| (snap, app.diff_state.scroll_offset));
         }
 
         // Shorter poll while background work is in flight keeps streaming
@@ -712,6 +739,9 @@ fn main() -> anyhow::Result<()> {
                             _ => {}
                         }
                     }
+                    Event::Resize(_, _) => {
+                        saw_resize = true;
+                    }
                     _ => {}
                 }
                 if app.should_quit || !event::poll(Duration::ZERO)? {
@@ -771,4 +801,48 @@ fn run_editor_from_tui<W: Write>(
     let editor_result = tuicr::editor::run_editor(target);
     suspension.resume()?;
     Ok(editor_result)
+}
+
+/// Layout fingerprint of the diff panel used to decide whether a terminal
+/// scroll-region shift is safe between two frames.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct DiffScrollSnapshot {
+    inner: Rect,
+    show_file_list: bool,
+    show_commit_selector: bool,
+    review_commits_len: usize,
+}
+
+impl DiffScrollSnapshot {
+    /// Capture a snapshot if the current state is eligible for scroll-region
+    /// optimisation: no overlays, no line wrapping (one logical line == one
+    /// terminal row), and the diff panel area is known from the last render.
+    fn capture(app: &App) -> Option<Self> {
+        if app.diff_state.wrap_lines {
+            return None;
+        }
+        if !matches!(
+            app.input_mode,
+            InputMode::Normal | InputMode::VisualSelect | InputMode::Search | InputMode::Command
+        ) {
+            return None;
+        }
+        let area = app.diff_area?;
+        if area.width < 3 || area.height < 3 {
+            return None;
+        }
+        // Borders::ALL on the diff block: inner area is inset by 1 on each side.
+        let inner = Rect {
+            x: area.x + 1,
+            y: area.y + 1,
+            width: area.width - 2,
+            height: area.height - 2,
+        };
+        Some(Self {
+            inner,
+            show_file_list: app.show_file_list,
+            show_commit_selector: app.show_commit_selector,
+            review_commits_len: app.review_commits.len(),
+        })
+    }
 }

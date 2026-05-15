@@ -90,6 +90,13 @@ impl<W: Write> TerminalSession<W> {
         self.terminal.backend_mut()
     }
 
+    /// Shifts a row range with DECSTBM so the next `draw` only has to emit
+    /// the rows that scrolled into view. Delegates to the patched ratatui
+    /// `Terminal::scroll_region`.
+    pub fn scroll_region(&mut self, rows: std::ops::Range<u16>, delta: i32) -> std::io::Result<()> {
+        self.terminal.scroll_region(rows, delta)
+    }
+
     /// Restores the terminal state for the normal exit path.
     ///
     /// After this succeeds,
